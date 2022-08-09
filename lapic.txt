@@ -1,0 +1,259 @@
+## LAPIC (Local Advanced Programmable Interrupt Controller)
+
+A Local APIC is responsible for handling thread (in an SMT system) or core local
+interrupts, such as exception handlers and locally generated IRQs (APIC timer,
+LINT1, LINT2 - which stands for Local Interrupt) and accept IRQs from the I/O
+APIC.
+
+The default memory mapped address of the LAPIC is 0xFEE00000 but should be read
+from the MADT or MSRs. Each CPU has it's own LAPIC mapped at this location,
+meaning CPUs cannot change each other's LAPICs.
+
+# Communicating with the Local APIC
+
+The Local APIC defines a memory mapped range starting at apic_base.
+Registers have to be read or written as whole 32 bit double words!!!
+
+# code example (C):
+
+uint32_t apic_read(void* apic_base, uint32_t register) {
+    return *((volatile uint32_t*)(apic_base + register));
+}
+
+void apic_write(void* apic_base, uint32_t register, uint32_t data) {
+    *((volatile uint32_t*)(apic_base + register)) = data;
+}
+
+NOTE: the use of 'volatile' so that these seemingly useless memory accesses
+are not optimized away by the compiler
+
+# Registers
+
+APICREG_SPURIOUS:
+Offset of this register is 0xF0.
+This register holds the interrupt vector for the spurious interrupt. Spurious
+interrupts should be ignored but should still signal an EOI.
+Bits 0:7 contain the interrupt vector of the spurious interrupt
+Bit 8 enables the Local APIC
+NOTE: on some older systems the low 4 bits of the spurious interrupt vector are
+hard-wired to 1, meaning the vector has to be xxxx1111. A recommended vector to
+use is 0xFF as it follows this rule and is out of the way of normal interrupts.
+
+APICREG_EOI:
+Offset of this register is 0xB0.
+This register is used to tell the Local APIC the 'End Of Interrupt' signal.
+This is done by writing a 0 into the register, non-zero values cause a general
+protection fault.
+
+APICREG_LINT0 and APICREG_LINT1:
+Offset of APICREG_LINT0 is 0x350, APICREG_LINT1 is 0x360
+These registers are the local vector descriptors for the two local interrupts.
+They are very similar to the I/O APIC's IOREDTBL (see apic/ioapic.txt).
+
+Bits 0:7 contain the interrupt vector that will be fired
+Bits 8:11 contain the type of interrupt
+ - 000: Normal
+ - 100: NMI (Non-Maskable Interrupt)
+Bit 12 contains the interrupt status
+ - 0: Idle
+ - 1: Interrupt pending
+Bit 13 contains pin polarity
+ - 0: Active high
+ - 1: Active low
+Bit 14 contains an acknowledgement signal for level triggered interrupts
+Bit 15 contains the trigger mode
+ - 0: edge triggered
+ - 1: level triggered
+Bit 16 is a mask bit, setting this bit will mask the IRQ (NMI still fires!)
+
+The LINT0 and LINT1 interrupts are usually not actively used, they can however
+be defined in the MADT as NMI entries.
+
+code example (C):
+
+void apic_set_nmi(uint8_t vec, uint8_t proc_id, uint16_t flags, uint8_t lint) {
+    .. find the APIC base of the APIC corresponding to the CPU with proc_id
+    void* apic_base = apic_base of processor's APIC;
+
+    // set as NMI and set the desired interrupt vector from the IDT
+    uint32_t nmi = 800 | vec;
+    // active low
+    if (flags & 2) {
+        nmi |= 1 << 13;
+    }
+    // level triggered
+    if (flags & 8) {
+        nmi |= 1 << 15;
+    }
+    if (lint == 1) {
+        // set APICREG_LINT1
+        apic_write(apic_base, 0x360, nmi);
+    }else if (lint == 0) {
+        // set APICREG_LINT0
+        apic_write(apic_base, 0x350, nmi);
+    }
+}
+
+APICREG_TIMER:
+Offset of this register is 0x320.
+This is the interrupt vector the LAPIC timer will fire, structure is similar to
+LINT1 and LINT0 but it's missing a few fields.
+
+Bits 0:7 contain the interrupt vector that will be fired
+Bit 12 contains the interrupt status
+ - 0: Idle
+ - 1: Interrupt pending
+Bit 16 is a mask bit, setting this bit will mask the IRQ
+
+APICREG_ICR1:
+Offset of this register is 0x310.
+The Interrupt Command Register 1 only contains the ID of the target APIC.
+Writing to this register does not trigger anything.
+
+Bits 24:31 contain the ID of the target APIC.
+
+APICREG_ICR0:
+Offset of this register is 0x300.
+The Interrupt Command Register 0 further specifies what to send to the APIC in
+ICR1.
+Writing to this register causes the interrupt defined in it to be sent to the
+APIC defined in ICR1. Thus ICR1 should be written first!
+
+Bits 0:7 contain the interrupt vector to trigger (or page number for SIPIs)
+Bits 8:10 contain the type of interrupt to be sent
+ - 000: normal
+ - 001: lowest priority
+ - 010: SMI (System Management Interrupt)
+ - 100: NMI (Non-Maskable Interrupt)
+ - 101: INIT or INIT level de-assert
+ - 110: SIPI (Startup Inter-Processor Interrupt)
+Bit 11 contains the destination mode (see I/O APIC IOREDTBL)
+Bit 12 contains the delivery status
+ - 0: Idle
+ - 1: Interrupt still delivering to target APIC
+Bit 14 is the level assertion bit for level triggered interrupts
+ - 0: De-assert
+ - 1: Assert
+Bit 15 is the interrupt trigger mode
+ - 0: Edge triggered (one-shot interrupt essentially)
+ - 1: Level triggered (will keep firing until the level is de-asserted)
+Bits 18:19 contain the destination type
+ - 0: Use APIC ID in ICR1
+ - 1: Send interrupt to itself
+ - 2: Send interrupt to all processors
+ - 3: Send interrupt to all processors except itself
+
+# Setting up the Local APIC
+
+First you have to disable the legacy 8259 PICs, that is, remap their IRQs to
+interrupt vectors that you don't need (as you won't be able to properly handle
+PIC interrupts anymore but they could still spuriously fire) and mask them.
+
+Secondly you configure the APIC, you can read or write it's base address in the
+IA32_APIC_BASE MSR (MSR 0x1B), then enable it by setting the spurious vector
+register.
+
+IA32_APIC_BASE MSR:
+Bit 8 This processor is the BSP (BootStrap Processor)
+Bit 10 EXTD - Enable x2APIC mode
+Bit 11 EN - xAPIC global enable/disable
+Bits 12:35 contains the LAPIC base on a page boundary, this should NOT be
+shifted down by 12 bits, it should rather be left at the current alignment,
+forming a 36 bit address with the lowest 12 bits always clear.
+
+code example (C):
+
+void apic_enable(void* apic_base, uint8_t spurious_vector) {
+    // all other bits of APICREG_SPURIOUS are reserved,
+    // so we should preserve them
+    uint32_t spurious_reg = apic_read(apic_base, APICREG_SPURIOUS);
+    // enable the Local APIC (bit 8)
+    // and set the spurious vector to 0xFF
+    apic_write(apic_base, APICREG_SPURIOUS, spurious_reg | 0x1FF);
+}
+
+# Sending an interrupt
+
+To send an interrupt to a different CPU, fill in the ICR0 and ICR1 registers
+accordingly.
+
+# code example (C):
+
+void apic_send_interrupt(void* apic_base, uint8_t target_apic, uint8_t vector) {
+    apic_write(apic_base, APICREG_ICR1, ((uint32_t)target_apic) << 24);
+    apic_write(apic_base, APICREG_ICR0, vector);
+}
+
+# Processor startup sequence
+
+Starting up another processor (AP - application processor) is done by sending
+a series of init and startup interrupts with some delay inbetween.
+
+1, Copy the CPU startup code to somewhere below 1 MiB.
+
+The AP will start in 16 bit real mode, so it will likely not be able to access
+your standard memory areas. For this you need to copy a piece of code under
+1 MiB that will set up the CPU to your desired state, such as Long Mode, and
+will communicate with the main CPU (BSP - BootStrap Processor) during startup.
+Such code is called 'trampoline code'.
+It is important for this code to be page-aligned as the Startup IPI holds the
+page index to start execution in.
+
+2, Send an INIT IPI
+
+3, Wait 10 milliseconds to give the CPU some time to initialize
+
+3, send a Startup IPI with your trampoline code page index
+
+4, Wait 1 millisecond for the trampoline code to set some sort of a flag
+
+5, Check the flag, if it is set, tell the processor to continue initialization,
+if it is not set, continue sequence
+
+6, If the processor didn't set a flag, send another Startup IPI and wait 1000
+milliseconds
+
+7, Check the flag again, if it is set, tell the processor to continue,
+if it is not set, give up and mark the APIC ID as nonfunctioning
+
+For timing it is best to use the standard PIT, meaning before you startup any
+processors, you have to have your BSPs Local APIC set up and the I/O APIC set up
+
+After the trampoline code sets up the processor to a usable state, it also has
+to set up its Local APIC, load an IDT, enable interrupts, etc.
+
+# code example (C):
+
+void apic_start_ap(void* apic_base, uint8_t target_apic_id) {
+    .. copy trampoline code
+    void* trampoline = pointer to trampoline code (page aligned);
+
+    // Send the INIT IPI
+    apic_write(apic_base, APICREG_ICR1, ((uint32_t)target_apic_id) << 24);
+    apic_write(apic_base, APICREG_ICR0, 0x500);
+    // wait 10ms
+    pit_sleep(10);
+    // Send the Startup IPI
+    apic_write(apic_base, APICREG_ICR1, ((uint32_t)target_apic_id) << 24);
+    apic_write(apic_base, APICREG_ICR0, 0x600 | (uint32_t)trampoline);
+    // wait 1ms
+    pit_sleep(1);
+    if (flag_is_set()) {
+        continue_init();
+        // wait for full initialization and then startup another AP
+    }else{
+        // Send the Startup IPI again
+        apic_write(apic_base, APICREG_ICR1, ((uint32_t)target_apic_id) << 24);
+        apic_write(apic_base, APICREG_ICR0, 0x600 | (uint32_t)trampoline);
+        // wait 1s
+        pit_sleep(1000);
+        if (flag_is_set()) {
+            continue_init();
+            // wait for full initialization and then startup another AP
+        }else{
+            mark_broken(target_apic_id);
+            // give up
+        }
+    }
+}
+

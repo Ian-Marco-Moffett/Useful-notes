@@ -1,0 +1,169 @@
+## IOAPIC (Input/Output Advanced Programmable Interrupt Controller)
+
+IO APIC structures can be found in the ACPI MADT (acpi/madt.txt)
+
+An I/O APIC is responsible for routing CPU external interrupts to threads/cores
+and the appropriate IDT vectors.
+
+# Communicating with the I/O APIC
+
+The I/O APIC defines two memory mapped registers, a register-select register
+('IOREGSEL') and a data register ('IOREGWIN'). Register-select is used to select
+which internal I/O APIC register we want to use, the data register is then
+read/written to read or write data to the internal register selected in
+register-select.
+
+IOREGSEL:
+Its a 32 bit register (has to be written as a whole double-word!!!), the lowest
+8 bits specify the internal I/O APIC register we want to use, other bits are
+reserved. Offset of IOREGSEL from the IOAPIC_base is 0 bytes.
+
+IOREGWIN:
+Its a 32 bit register (has to be read or written as a whole double-word!!!),
+this is the data register of the I/O APIC. Offset of IOREGWIN from the
+IOAPIC_base is +16 bytes.
+
+# code example (C):
+
+uint32_t ioapic_read(void* ioapic_base, uint8_t register) {
+    // tell IOREGSEL which register we want to read
+    *(volatile uint32_t*)(ioapic_base) = register;
+    // read the selected register from IOREGWIN
+    return *(volatile uint32_t*)(ioapic_base + 16);
+}
+
+void ioapic_write(void* ioapic_base, uint8_t register, uint32_t data) {
+    // tell IOREGSEL which register we want to write
+    *(volatile uint32_t*)(ioapic_base) = register;
+    // write the selected register through IOREGWIN
+    *(volatile uint32_t*)(ioapic_base + 16) = data;
+}
+
+NOTE: the use of 'volatile' so that these seemingly useless memory accesses
+are not optimized away by the compiler
+
+# Internal I/O APIC registers
+
+IOAPICID (I/O APIC ID):
+The IOREGSEL index of this register is 0. It is read/write.
+Bits 24:31 contain the I/O APIC ID of thise I/O APIC.
+
+IOAPICVER (I/O APIC Version):
+The IOREGSEL index of this register is 1. It is read-only.
+Bits 0:7 contain the implementation version
+Bits 16:23 contain the maximum amount of redirections (GSIs) this I/O APIC
+can handle - effectively the amount of interrupt vectors
+
+IOAPICARB (I/O APIC Arbitration):
+The IOREGSEL index of this register is 2. It is read/write.
+Bits 24:27 contain the arbitration ID - the priority of the I/O APIC on the
+APIC bus
+
+IOREDTBL (I/O Redirection Table):
+Starting at IOREGSEL index 16 follow registers for IOAPICVER.max_redirections
+amount of interrupts, two registers per interrupt as every redirection entry is
+64 bits long.
+Bits 0:7 contain the interrupt vector that will be fired
+Bits 8:10 contain the delivery mode of the interrupt
+ - 000: fixed
+ - 001: lowest priority
+ - 010: SMI (System Management Interrupt)
+ - 100: NMI (Non-Maskable Interrupt)
+ - 101: INIT (Initialization Interrupt)
+ - 111: ExtINT (External Interrupt)
+Bit 11 contains how the destination should be interpreted
+ - 0: Physical Destination
+ - 1: Logical Destination
+Bit 12 contains the delivery status
+ - 0: Idle
+ - 1: IRQ sent to Local APIC but still waiting for acknowledgement
+Bit 13 contains pin polarity (for ISA IRQs assume active high unless specified)
+ - 0: Active high
+ - 1: Active low
+Bit 14 contains an acknowledgement signal for level triggered interrupts
+Bit 15 contains the trigger mode (for ISA IRQs assume edge triggered)
+ - 0: edge triggered
+ - 1: level triggered
+Bit 16 is a mask bit, setting this bit will mask the IRQ (NMI still fires!)
+Bit 56:63 contain the destination mode
+ - if bit 11 (destination mode) is clear, this field contains the Local APIC ID
+   the interrupt will be delivered to (multi-core interrupt balancing :D)
+ - if destination mode is set, this field contains the logical destination
+   format, which you should not use
+
+# Interrupt Source Override:
+
+These are defined in the MADT together with the Local APIC and I/O APIC as
+normal entries.
+
+The Interrupt Source Override redirects IO APIC's Global System Interrupts (GSI)
+to interrupt vectors in such a way that they correspond to legacy 8259 PIC
+mappings. The 'interrupt' field signifies the GSI (which is basically the
+interrupt pin on the IO APIC) that is fired when certain things happen, the
+bus:irq fields signify the legacy PIC interrupt that corresponds to this event,
+bus:irq can be changed by the application to any other interrupt vector.
+The interrupt is effectively disabled if its corresponding redirection entry
+is not present.
+
+# Example:
+
+bus:irq = 0 ; Legacy PIT timer IRQ
+GSI     = 2 ; Global System Interrupt in a modern IO APIC system is IRQ 2
+
+This means that whenever a timer interrupt occurs, it actually fires IO APIC pin
+2, which should (given the application installed redirects correctly) be
+redirected to interrupt vector 0, which is the same interrupt vector as legacy
+PIC timer IRQ. This way the application does not need two separate interrupt
+descriptor tables (one for PIT and one for IO APIC mode) and also allows
+hardware interrupt wiring to be different per-system, as the standard MADT ISOs
+should always re-route IRQs to the same vectors as in legacy PIC mode.
+
+# Installing redirection entries
+
+The Global System Interrupt of a redirection entry is the index in the
+redirection table (IOREDTBL), just don't forget to offset the GSI by the
+starting interrupt index the I/O APIC can handle, that can be found in the MADT
+(field 'interrupt_base').
+
+For installing Interrupt Source Overrides, all needed information is provided
+in the MADT entry for the ISO.
+
+if bit 1 of ISO.flags is set, the interrupt is active low, else active high.
+if bit 3 of ISO.flags is set, the interrupt is level triggered, else edge
+triggered.
+ISO.interrupt is the entry to use (don't forget to offset by interrupt_base)
+ISO.bus:ISO.irq is the vector to fire (don't forget to offset by whatever index
+in the IDT your IRQ handlers start at, bus:irq is given in the form of PIC IRQ
+indices, thus they start at 0, realistically you want them to fire higher
+interrupt vectors because the first 32 vectors are reserved by Intel for
+exception handlers)
+
+# code example (C):
+
+void ioapic_redirect(uint8_t irq, uint32_t GSI, uint16_t flags, uint8_t apic) {
+    .. find the I/O APIC which covers this GSI
+    (interrupt_base is <= GSI && interrupt_base + max_redirections > GSI)
+    uint32_t ioapic_base = base of a suitable I/O APIC;
+
+    // offset the interrupt vector to start directly after exception handlers
+    uint64_t redirection = irq + 32;
+    // active low
+    if (flags & 2) {
+        redirection |= 1 << 13;
+    }
+    // level triggered
+    if (flags & 8) {
+        redirection |= 1 << 15;
+    }
+    // put the APIC ID of the target APIC (the APIC that will handle this IRQ)
+    redirection |= ((uint64_t)apic) << 56;
+
+    // IOREGTBL registers start at index 16 and GSI has to be offset by the I/O
+    // APIC's interrupt base
+    uint32_t ioredtbl = (GSI - interrupt_base of I/O APIC) * 2 + 16;
+
+    // write the IOREGTBL as two 32 bit writes
+    ioapic_write(ioapic_base, ioredtbl + 0, (uint32_t)(redirection));
+    ioapic_write(ioapic_base, ioredtbl + 1, (uint32_t)(redirection >> 32));
+}
+
